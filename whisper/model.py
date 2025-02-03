@@ -224,6 +224,47 @@ class TextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
+        # Optimisation: pre-compute and register the mask in CUDA if available
+        if torch.cuda.is_available():
+            self.register_buffer("mask_cuda", mask.cuda(), persistent=False)
+
+
+    def forward(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
+        """
+        Args:
+            tokens: (n_batch, n_token)
+            audio_features: (n_batch, n_audio_ctx, n_audio_state)
+
+        Returns:
+            logits: (n_batch, n_token, n_vocab)
+        """
+        n_batch, n_token = tokens.shape
+        n_audio_ctx, n_audio_state = audio_features.shape[1:]
+
+        x = self.token_embedding(tokens) + self.positional_embedding[:n_token]
+
+        # Optimisation: Move audio_features to GPU once here.
+        if torch.cuda.is_available():
+            audio_features = audio_features.cuda()
+
+
+        for block in self.blocks:
+            x = block(x, audio_features)
+
+        x = self.ln(x)
+        logits = x @ self.token_embedding.weight.T
+
+        # Optimisation: Apply the precomputed CUDA mask if available.
+        if torch.cuda.is_available():
+             mask = self.mask_cuda[:n_token, :n_token]
+        else:
+            mask = self.mask[:n_token, :n_token]
+        
+        logits = logits + mask
+
+        return logits
+
+
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
